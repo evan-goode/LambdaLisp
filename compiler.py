@@ -3,8 +3,10 @@
 from typing import Dict, Tuple, List, FrozenSet
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-
 import sys
+
+# a bit overkill just for an implementation of Tarjan's
+import networkx as nx
 
 # Target language (de Bruijn notation Blc)
 
@@ -261,12 +263,80 @@ class SrcStr(SrcExpr):
         srcbyte_list = [SrcByte(b) for b in bytes(self.value, encoding="utf-8")]
         return SrcList(srcbyte_list).simplify()
 
-# @dataclass
-# class SrcBlock(SrcExpr):
-#     statements: List[SrcExpr]
+@dataclass
+class SrcDefine(SrcExpr):
+    var_name: str
+    value: SrcExpr
 
-#     def compile(self, context) -> TgtExpr:
-#         pass
+    def simplify(self):
+        raise NotImplementedError("SrcDefine must be part of a SrcBlock")
+
+@dataclass
+class SrcBlock(SrcExpr):
+    statements: List[SrcExpr]
+
+    Y = dbn_to_srcexpr("λ [λ [1 [0 0]] λ [1 [0 0]]]")
+
+    def make_sequence(self, statements):
+        if not statements:
+            return SrcVar("if")
+        return SrcApp(
+            SrcApp(statements[0], SrcVar("put")),
+            self.make_sequence(statements[1:]),
+        )
+
+    def simplify(self):
+        # This should pad out the paper pretty nice!
+
+        definitions = {}
+
+        sequence = []
+
+        for statement in self.statements:
+            if isinstance(statement, SrcDefine):
+                if statement.var_name in definitions:
+                    raise ValueError(f"{statement.var_name} is already defined!")
+                definitions[statement.var_name] = statement.value
+            else:
+                # run statements sequentially
+                sequence.append(statement)
+
+        defined_names = frozenset(definitions.keys())
+
+        # find strongly-connected components in dependency graph
+        G = nx.DiGraph()
+
+        directly_recursive = set()
+
+        for i, name in enumerate(definitions):
+            value = definitions[name]
+            G.add_node(name, define=define)
+            references = value.get_references() & defined_names
+            if define.var_name in references:
+                directly_recursive.add(define.var_name)
+            G.add_edges_from((define.var_name, d) for d in references)
+
+        bindings = []
+
+        for scc in nx.strongly_connected_components(G):
+            if len(scc) == 1:
+                var_name = scc[0]
+                if var_name in directly_recursive:
+                    # directly recursive
+
+                    recursive_version = SrcApp(
+                        self.Y,
+                        SrcAbs(var_name, definitions[var_name]),
+                    )
+
+                    bindings.append(scc[0], recursive_version)
+                
+            else:
+                # TODO mutual recursion
+                pass
+
+        return self.make_sequence(sequence).simplify()
+        
 
 @dataclass
 class SrcLet(SrcExpr):
@@ -292,33 +362,10 @@ builtins = {
     "print": (
         SrcAbs("str", SrcApp(SrcVar("str"), SrcVar("put")))
     ),
-    "pair": (
-        dbn_to_srcexpr("λλλ [[0 2] 1]")
-    ),
+    "pair": dbn_to_srcexpr("λλλ [[0 2] 1]"),
+    "if": dbn_to_srcexpr("λ 0"),
+    "or": dbn_to_srcexpr("λλ [[0 0] 1]"),
 }
-
-# @dataclass
-# class SrcBuiltin(SrcExpr):
-#     name: str
-
-#     builtins = {
-#         "print": (
-#             SrcAbs("str", SrcApp(SrcVar("str"), SrcVar("put")))
-#         ),
-#         "pair": (
-#             dbn_to_srcexpr("λλλ [[0 2] 1]")
-#         ),
-#     }
-
-#     def __post_init__(self):
-#         if self.name not in self.builtins:
-#             raise ValueError(f"{self.name} is not a built-in expression")
-
-#     def get_references(self):
-#         return self.builtins[self.name].get_references()
-
-#     def compile(self, context):
-#         return self.builtins[self.name].compile(context)
 
 @dataclass
 class SrcRoot(SrcExpr):
@@ -381,10 +428,13 @@ if __name__ == "__main__":
 
     # Hello world example
     srcexpr = SrcRoot(
-        SrcApp(
-            SrcVar("print"),
-            SrcStr("Hello world 🌎"),
-        )
+        SrcBlock([
+            SrcStr("a"),
+            SrcStr("b"),
+            SrcStr("c"),
+            # SrcDefine("a", SrcApp(SrcVar("b"), SrcNil())),
+            # SrcDefine("b", SrcApp(SrcVar("a"), SrcNil())),
+        ])
     )
 
     print(srcexpr, file=sys.stderr)
