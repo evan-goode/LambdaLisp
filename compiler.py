@@ -41,27 +41,34 @@ class TgtVar(TgtExpr):
     def to_dbn(self) -> str:
         return str(self.index)
 
-
 # Source language (our Lisp)
 
 class SrcExpr(ABC):
     """An expression in the source language"""
 
-    def get_references(self) -> FrozenSet[str]:
-        """Return a set of names that the expression references. Default to
-        empty set. Must include the names of any builtins the expression
-        uses."""
-        return frozenset()
-
     @abstractmethod
-    def compile(self, context: Dict[str, int]) -> TgtExpr:
+    def simplify(self) -> "SimpleExpr":
+        """Convert to a SimpleExpr and a set of references"""
+        pass
+
+    def get_references(self) -> frozenset[str]:
+        return self.simplify().get_references()
+
+# Simplified subset of source language
+class SimpleExpr(SrcExpr):
+    @abstractmethod
+    def compile(self, context: Dict[str, int]) -> "TgtExpr":
         """Convert this expression to an equivalent expression in lambda
         calculus. The `context` parameter maps variable names to their de
         Bruijn indices"""
         pass
 
+    @abstractmethod
+    def get_references(self) -> frozenset[str]:
+        pass
+
 @dataclass
-class SrcAbs(SrcExpr):
+class SrcAbs(SimpleExpr):
     """Abstraction. Eventually support multiple parameters."""
     var_name: str
     expr: SrcExpr
@@ -69,6 +76,9 @@ class SrcAbs(SrcExpr):
     def get_references(self):
         # Don't count references to the bound variable
         return self.expr.get_references() - frozenset((self.var_name,))
+
+    def simplify(self):
+        return SrcAbs(self.var_name, self.expr.simplify())
 
     def compile(self, context):
         # Increment the de Bruijn index of each variable already bound
@@ -79,7 +89,7 @@ class SrcAbs(SrcExpr):
         return TgtAbs(self.expr.compile(new_context))
 
 @dataclass
-class SrcAnonAbs(SrcExpr):
+class SrcAnonAbs(SimpleExpr):
     """Abstraction with an unnamed variable. Used for translating de Bruijn
     lambda calculus directly into the source language"""
     expr: SrcExpr
@@ -87,32 +97,44 @@ class SrcAnonAbs(SrcExpr):
     def get_references(self):
         return self.expr.get_references()
 
+    def simplify(self):
+        return SrcAnonAbs(self.expr.simplify())
+
     def compile(self, context):
         new_context = {k: v + 1 for k, v in context.items()}
         return TgtAbs(self.expr.compile(new_context))
 
 @dataclass
-class SrcVar(SrcExpr):
+class SrcVar(SimpleExpr):
     """Named variable"""
     name: str
 
     def get_references(self):
         return frozenset((self.name,))
 
+    def simplify(self):
+        return self
+
     def compile(self, context):
         # Look up the variable's index in the `context`
         return TgtVar(context[self.name])
 
 @dataclass
-class SrcAnonVar(SrcExpr):
+class SrcAnonVar(SimpleExpr):
     """Unnamed variable with only an index. Directly corresponds to TgtVar."""
     index: int
+
+    def get_references(self):
+        return frozenset()
+
+    def simplify(self):
+        return self
 
     def compile(self, context) -> TgtVar:
         return TgtVar(self.index)
 
 @dataclass
-class SrcApp(SrcExpr):
+class SrcApp(SimpleExpr):
     """Function application. Directly corresponds to TgtApp."""
     function: SrcExpr
     argument: SrcExpr
@@ -120,14 +142,17 @@ class SrcApp(SrcExpr):
     def get_references(self):
         return self.function.get_references() | self.argument.get_references()
 
+    def simplify(self):
+        return SrcApp(self.function.simplify(), self.argument.simplify())
+
     def compile(self, context) -> TgtApp:
         return TgtApp(self.function.compile(context), self.argument.compile(context))
 
-def dbn_to_srcexpr(dbn: str) -> SrcExpr:
+def dbn_to_srcexpr(dbn: str) -> SimpleExpr:
     """Convert de Bruijn notation lambda calculus directly to the source
     language."""
 
-    def dbn_to_srcexpr_rem(dbn: str) -> Tuple[SrcExpr, str]:
+    def dbn_to_srcexpr_rem(dbn: str) -> Tuple[SimpleExpr, str]:
         char = dbn[0]
         if char == "λ":
             body, remaining = dbn_to_srcexpr_rem(dbn[1:])
@@ -162,16 +187,16 @@ class SrcNat(SrcExpr):
             )
         )
 
-    def compile(self, context) -> TgtAbs:
-        return make_nat(self.value).compile(context)
+    def simplify(self):
+        return make_nat(self.value)
 
 @dataclass
 class SrcBool(SrcExpr):
     """Boolean. λλ 0 is false, λλ 1 is true."""
     value: bool
 
-    def compile(self, context) -> TgtExpr:
-        return dbn_to_srcexpr(f"λλ {int(self.value)}").compile(context)
+    def simplify(self):
+        return dbn_to_srcexpr(f"λλ {int(self.value)}")
 
 # @dataclass
 # class SrcPair(SrcExpr):
@@ -194,15 +219,12 @@ class SrcBool(SrcExpr):
 class SrcNil(SrcExpr):
     nil = dbn_to_srcexpr("λλ 0")
 
-    def compile(self, context) -> TgtExpr:
-        return self.nil.compile(context)
+    def simplify(self):
+        return self.nil
 
 @dataclass
 class SrcList(SrcExpr):
     elements: List[SrcExpr]
-
-    def get_references(self):
-        return frozenset.union(*(e.get_references() for e in self.elements))
 
     def make_list(self, l: List[SrcExpr]):
         if l == []:
@@ -217,27 +239,27 @@ class SrcList(SrcExpr):
             )
         )
 
-    def compile(self, context) -> TgtExpr:
-        return self.make_list(self.elements).compile(context)
+    def simplify(self):
+        return self.make_list(self.elements).simplify()
         
 @dataclass
 class SrcByte(SrcExpr):
     """I/O byte as a list of bools"""
     value: int
 
-    def compile(self, context) -> TgtExpr:
+    def simplify(self):
         bits = ((self.value >> (7 - i)) & 1 for i in range(0, 8))
         srcbool_list = [SrcBool(not bool(bit)) for bit in bits]
-        return SrcList(srcbool_list).compile(context)
+        return SrcList(srcbool_list).simplify()
 
 @dataclass
 class SrcStr(SrcExpr):
     """List of bytes"""
     value: str
 
-    def compile(self, context) -> TgtExpr:
+    def simplify(self):
         srcbyte_list = [SrcByte(b) for b in bytes(self.value, encoding="utf-8")]
-        return SrcList(srcbyte_list).compile(context)
+        return SrcList(srcbyte_list).simplify()
 
 # @dataclass
 # class SrcBlock(SrcExpr):
@@ -263,31 +285,40 @@ class SrcLet(SrcExpr):
             value,
         )
     
-    def compile(self, context) -> TgtExpr:
-        return self.make_let(self.bindings).compile(context)
+    def simplify(self):
+        return self.make_let(self.bindings).simplify()
 
-@dataclass
-class SrcBuiltin(SrcExpr):
-    name: str
+builtins = {
+    "print": (
+        SrcAbs("str", SrcApp(SrcVar("str"), SrcVar("put")))
+    ),
+    "pair": (
+        dbn_to_srcexpr("λλλ [[0 2] 1]")
+    ),
+}
 
-    builtins = {
-        "print": (
-            SrcAbs("str", SrcApp(SrcVar("str"), SrcVar("put")))
-        ),
-        "pair": (
-            dbn_to_srcexpr("λλλ [[0 2] 1]")
-        ),
-    }
+# @dataclass
+# class SrcBuiltin(SrcExpr):
+#     name: str
 
-    def __post_init__(self):
-        if self.name not in self.builtins:
-            raise ValueError(f"{self.name} is not a built-in expression")
+#     builtins = {
+#         "print": (
+#             SrcAbs("str", SrcApp(SrcVar("str"), SrcVar("put")))
+#         ),
+#         "pair": (
+#             dbn_to_srcexpr("λλλ [[0 2] 1]")
+#         ),
+#     }
 
-    def get_references(self):
-        return self.builtins[self.name].get_references()
+#     def __post_init__(self):
+#         if self.name not in self.builtins:
+#             raise ValueError(f"{self.name} is not a built-in expression")
 
-    def compile(self, context):
-        return self.builtins[self.name].compile(context)
+#     def get_references(self):
+#         return self.builtins[self.name].get_references()
+
+#     def compile(self, context):
+#         return self.builtins[self.name].compile(context)
 
 @dataclass
 class SrcRoot(SrcExpr):
@@ -296,23 +327,25 @@ class SrcRoot(SrcExpr):
 
     block: SrcExpr
 
-    def compile(self, context) -> TgtExpr:
+    def simplify(self):
 
         # find all builtins used
-        referenced_builtins = self.block.get_references() & frozenset(SrcBuiltin.builtins.keys())
+        referenced_builtins = self.block.get_references() & frozenset(builtins.keys())
+
         print("Found builtins:", referenced_builtins, file=sys.stderr)
     
         builtin_bindings = [
-            (name, SrcBuiltin.builtins[name])
+            (name, builtins[name])
             for name in referenced_builtins
         ]
 
+        # TODO switch to define to allow recursive builtins
         body = SrcLet(
             builtin_bindings,
             self.block,
         )
 
-        return SrcAbs("gro", SrcAbs("put", body)).compile(context)
+        return SrcAbs("gro", SrcAbs("put", body)).simplify()
 
 # def tokenize(s: str) -> Generator[str, None, None]
 #     # Adapted from
@@ -356,6 +389,8 @@ if __name__ == "__main__":
 
     print(srcexpr, file=sys.stderr)
 
-    tgtexpr = srcexpr.compile({})
+    simpleexpr = srcexpr.simplify()
+
+    tgtexpr = simpleexpr.compile({})
 
     print(tgtexpr.to_dbn())
