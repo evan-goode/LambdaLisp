@@ -3,9 +3,8 @@
 """
 TODO list
     typing?
+    tune stack parameter in Blc.S to allow executing larger programs
     parsing
-    mutual recursion
-    input
     nice builtin library
         https://en.wikipedia.org/wiki/Church_encoding#Signed_numbers
         nat->str
@@ -17,11 +16,13 @@ TODO list
 
 # "A language targeting SectorLambda sounds super cool." -Justine Tunney
 
-from typing import Dict, Tuple, List, FrozenSet
+from typing import Dict, Tuple, List, FrozenSet, Optional
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import sys
 import re
+from uuid import uuid4
+from subprocess import run, PIPE
 
 # For reasoning about indirect recursion
 import networkx as nx
@@ -61,6 +62,9 @@ class TgtVar(TgtExpr):
         return str(self.index)
 
 # Source language (our Lisp)
+
+Context = Dict[str, int]
+
 class SrcExpr(ABC):
     """An expression in the source language"""
 
@@ -69,14 +73,11 @@ class SrcExpr(ABC):
         """Convert to a simplified subset of the source language"""
         pass
 
-    def compile(self, context: Dict[str, int]) -> TgtExpr:
+    def compile(self, context: Context) -> TgtExpr:
         """Convert this expression to an equivalent expression in lambda
         calculus. The `context` parameter maps variable names to their de
         Bruijn indices"""
         return self.simplify().compile(context)
-
-    def get_references(self) -> frozenset[str]:
-        return self.simplify().get_references()
 
 class SimpleExpr(SrcExpr):
     """Intermediate, simplified subset of source language. We convert to this
@@ -85,7 +86,7 @@ class SimpleExpr(SrcExpr):
     since only SrcVars can make references, but awkward in the source
     language."""
     @abstractmethod
-    def compile(self, context: Dict[str, int]) -> TgtExpr:
+    def compile(self, context: Context) -> TgtExpr:
         pass
 
     @abstractmethod
@@ -98,14 +99,14 @@ class SrcAbs(SimpleExpr):
     var_name: str
     expr: SrcExpr
 
-    def get_references(self):
+    def get_references(self) -> frozenset[str]:
         # Don't count references to the bound variable
-        return self.expr.get_references() - frozenset((self.var_name,))
+        return self.expr.simplify().get_references() - frozenset((self.var_name,))
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return SrcAbs(self.var_name, self.expr.simplify())
 
-    def compile(self, context):
+    def compile(self, context: Context) -> TgtExpr:
         # Increment the de Bruijn index of each variable already bound
         new_context = {k: v + 1 for k, v in context.items()}
 
@@ -119,13 +120,13 @@ class SrcAnonAbs(SimpleExpr):
     lambda calculus directly into the source language."""
     expr: SrcExpr
 
-    def get_references(self):
-        return self.expr.get_references()
+    def get_references(self) -> frozenset[str]:
+        return self.expr.simplify().get_references()
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return SrcAnonAbs(self.expr.simplify())
 
-    def compile(self, context):
+    def compile(self, context: Context) -> TgtExpr:
         new_context = {k: v + 1 for k, v in context.items()}
         return TgtAbs(self.expr.compile(new_context))
 
@@ -134,13 +135,13 @@ class SrcVar(SimpleExpr):
     """Named variable"""
     name: str
 
-    def get_references(self):
+    def get_references(self) -> frozenset[str]:
         return frozenset((self.name,))
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return self
 
-    def compile(self, context):
+    def compile(self, context: Context) -> TgtExpr:
         # Look up the variable's index in the `context`
         return TgtVar(context[self.name])
 
@@ -149,13 +150,13 @@ class SrcAnonVar(SimpleExpr):
     """Unnamed variable with only an index. Directly corresponds to TgtVar."""
     index: int
 
-    def get_references(self):
+    def get_references(self) -> frozenset[str]:
         return frozenset()
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return self
 
-    def compile(self, context) -> TgtVar:
+    def compile(self, context: Context) -> TgtExpr:
         return TgtVar(self.index)
 
 @dataclass
@@ -164,13 +165,13 @@ class SrcApp(SimpleExpr):
     function: SrcExpr
     argument: SrcExpr
 
-    def get_references(self):
-        return self.function.get_references() | self.argument.get_references()
+    def get_references(self) -> frozenset[str]:
+        return self.function.simplify().get_references() | self.argument.simplify().get_references()
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return SrcApp(self.function.simplify(), self.argument.simplify())
 
-    def compile(self, context) -> TgtApp:
+    def compile(self, context: Context) -> TgtExpr:
         return TgtApp(self.function.compile(context), self.argument.compile(context))
 
 def dbn_to_srcexpr(dbn: str) -> SimpleExpr:
@@ -207,24 +208,35 @@ class SrcCall(SrcExpr):
             return SrcApp(self.function, arguments[0])
         return SrcApp(self.make_call(arguments[:-1]), arguments[-1])
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return self.make_call(self.arguments).simplify()
 
-# @dataclass
-# class SrcLambda(SrcExpr):
-#     """TODO Function definition with multiple arguments"""
-#     pass
+@dataclass
+class SrcLambda(SrcExpr):
+    """TODO Function definition with multiple arguments"""
+    var_names: List[str]
+    expr: SrcExpr
+
+    def make_lambda(self, var_names: List[str]) -> SrcExpr:
+        if not var_names:
+            return SrcAnonAbs(self.expr)
+        if len(var_names) == 1:
+            return SrcAbs(var_names[0], self.expr)
+        return SrcAbs(var_names[0], self.make_lambda(var_names[1:]))
+
+    def simplify(self) -> SimpleExpr:
+        return self.make_lambda(self.var_names).simplify()
 
 @dataclass
 class SrcNat(SrcExpr):
     """Church numeral"""
     value: int
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.value < 0:
             raise ValueError("Nat cannot be less than 0!")
 
-    def make_nat(self, n: int):
+    def make_nat(self, n: int) -> SrcExpr:
         if n == 0:
             return SrcAnonVar(0)
         return SrcApp(
@@ -232,7 +244,7 @@ class SrcNat(SrcExpr):
                 self.make_nat(n - 1)
             )
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return SrcAnonAbs(SrcAnonAbs(
             self.make_nat(self.value)
         )).simplify()
@@ -242,7 +254,7 @@ class SrcBool(SrcExpr):
     """Boolean. λλ 0 is false, λλ 1 is true."""
     value: bool
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return dbn_to_srcexpr(f"λλ {int(self.value)}")
 
 # Might want `pair` in the language rather than a builtin for type checking
@@ -266,9 +278,10 @@ class SrcBool(SrcExpr):
 
 @dataclass
 class SrcNil(SrcExpr):
+    """Equivalent to SrcBool(False)"""
     nil = dbn_to_srcexpr("λλ 0")
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return self.nil
 
 @dataclass
@@ -289,7 +302,7 @@ class SrcList(SrcExpr):
             )
         )
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return self.make_list(self.elements).simplify()
         
 @dataclass
@@ -297,9 +310,9 @@ class SrcByte(SrcExpr):
     """I/O byte as a list of bools"""
     value: int
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         bits = ((self.value >> (7 - i)) & 1 for i in range(0, 8))
-        srcbool_list = [SrcBool(not bool(bit)) for bit in bits]
+        srcbool_list: List[SrcExpr] = [SrcBool(not bool(bit)) for bit in bits]
         return SrcList(srcbool_list).simplify()
 
 @dataclass
@@ -307,16 +320,18 @@ class SrcStr(SrcExpr):
     """List of bytes"""
     value: str
 
-    def simplify(self):
-        srcbyte_list = [SrcByte(b) for b in bytes(self.value, encoding="utf-8")]
+    def simplify(self) -> SimpleExpr:
+        srcbyte_list: List[SrcExpr] = [SrcByte(b) for b in bytes(self.value, encoding="utf-8")]
         return SrcList(srcbyte_list).simplify()
 
 @dataclass
 class SrcDefine(SrcExpr):
+    """Define a variable. Can only be used inside a SrcBlock, since definitions
+    can depend on their siblings"""
     var_name: str
     value: SrcExpr
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         raise NotImplementedError("SrcDefine must be part of a SrcBlock!")
 
 @dataclass
@@ -336,11 +351,15 @@ class SrcLet(SrcExpr):
             value,
         )
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         return self.make_let(self.bindings).simplify()
 
 @dataclass
 class SrcBlock(SrcExpr):
+    """A block of multiple statements. Define statements will be "hoisted" to
+    the top and their definitions can be used in any statement in the block,
+    regardless of order. Recursion is allowed among defined expressions. Other
+    statements will be executed sequentially."""
     statements: List[SrcExpr]
 
     Y = dbn_to_srcexpr("λ [λ [1 [0 0]] λ [1 [0 0]]]")
@@ -355,7 +374,7 @@ class SrcBlock(SrcExpr):
             self.make_sequence(statements[1:]),
         )
 
-    def simplify(self):
+    def simplify(self) -> SimpleExpr:
         # This should pad out the paper pretty nice!
 
         definitions = {}
@@ -366,7 +385,10 @@ class SrcBlock(SrcExpr):
                 # Gather all the `define` statements
                 if statement.var_name in definitions:
                     raise ValueError(f"{statement.var_name} is already defined!")
-                definitions[statement.var_name] = statement.value
+
+                # Simplify the definition value ASAP to avoid computing the
+                # same simplification multiple times
+                definitions[statement.var_name] = statement.value.simplify()
             else:
                 # Run the other statements sequentially
                 sequence.append(statement)
@@ -404,6 +426,7 @@ class SrcBlock(SrcExpr):
                 var_name, = scc
                 if var_name in directly_recursive:
                     # directly recursive, apply ordinary Y combinator
+                    print("Found directly recursive function", var_name, file=sys.stderr)
                     fixed = SrcApp(
                         self.Y,
                         SrcAbs(var_name, definitions[var_name]),
@@ -413,8 +436,45 @@ class SrcBlock(SrcExpr):
                     # not recursive, add regular binding
                     bindings.append((var_name, definitions[var_name]))
             else:
-                # TODO mutual recursion
-                pass
+                print("Found indirect recursion among", scc, file=sys.stderr)
+    
+                func_list = SrcList([definitions[var_name] for var_name in scc])
+
+                # Merge each function in the SCC into one "multiplexing"
+                # function which switches behavior depending on its Nat
+                # argument
+
+                # The mux gets a unique name, like
+                # mux-odd-even-8fe86920-b389-4f0a-b94d-aefb6e9f38ae
+                mux_name = "-".join(("mux", "-".join(scc), str(uuid4())))
+
+                # Implement the mux as a list of functions that gets indexed by
+                # the argument
+                mux = SrcAnonAbs(
+                    SrcCall(SrcVar("list-ref"), [
+                        func_list,
+                        SrcAnonVar(0)
+                    ])
+                )
+
+                # To allow recursive calls from inside the mux, each function
+                # needs to be bound to the fixpoint applied to the function's
+                # index in the list
+                mux_bindings: List[Tuple[str, SrcExpr]] = []
+                for i, var_name in enumerate(scc):
+                    mux_bindings.append((var_name, SrcApp(SrcVar(mux_name), SrcNat(i))))
+
+                # Apply the Y combinator
+                fixed = SrcApp(
+                    self.Y,
+                    SrcAbs(mux_name, SrcLet(mux_bindings, mux))
+                )
+        
+                bindings.append((mux_name, fixed))
+                # Outside the fixpoint, each muxed function needs to be bound
+                # to the fixed mux applied to its index
+                for i, var_name in enumerate(scc):
+                    bindings.append((var_name, SrcApp(SrcVar(mux_name), SrcNat(i))))
 
         if bindings:
             return SrcLet(
@@ -423,25 +483,33 @@ class SrcBlock(SrcExpr):
             ).simplify()
         return self.make_sequence(sequence).simplify()
 
+# Built-in functions that are more "standard library" than "language feature"
+# TODO once parsing works, these can be defined in the source language.
+
+# Built-in functions can refer to other built-ins (or themselves) and SrcBlock
+# and SrcRoot will work out the recursion/dependencies.
+
 # TODO make a proper base-10 nat->str
 cons_S = SrcAbs("str", SrcCall(SrcVar("pair"), [SrcByte(83), SrcVar("str")]))
 nat_to_str = SrcAbs("n", 
     SrcCall(SrcVar("n"), [cons_S, SrcStr("")]),
 )
 
-# Built-in functions that are more "standard library" than "language feature"
-# TODO once parsing works, these can be defined in the source language.
+# Index a list. The name comes from Scheme
+list_ref = SrcLambda(["l", "i"], 
+    SrcApp(SrcVar("fst"),
+        SrcCall(SrcVar("i"), [SrcVar("snd"), SrcVar("l")])))
 
-# Built-in functions can refer to other built-ins (or themselves) and SrcBlock
-# and SrcRoot will work out the recursion/dependencies.
 builtins = {
-    "print": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcVar("put"))),
+    "print": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcVar("output"))),
     "if": dbn_to_srcexpr("λ 0"),
     "pair": dbn_to_srcexpr("λλλ [[0 2] 1]"),
+    "cons": SrcVar("pair"),
     "or": dbn_to_srcexpr("λλ [[0 0] 1]"),
     "and": dbn_to_srcexpr("λλ [[0 1] 0]"),
     "not": dbn_to_srcexpr("λλλ [[2 0] 1]"),
     "xor": dbn_to_srcexpr("λλ [[1 λλ [[2 0] 1]] 0]"),
+    "is-zero": dbn_to_srcexpr("λλλ [[2 λ 1] 1]"),
     "**": dbn_to_srcexpr("λλ [0 1]"),
     "*": dbn_to_srcexpr("λλλ [2 [1 0]]"),
     "++": dbn_to_srcexpr("λλλ [1 [[2 1] 0]]"),
@@ -456,39 +524,41 @@ builtins = {
     "<": dbn_to_srcexpr("λλ [[[0 λλ [0 1]] λλλ0] [[1 λλ [0 1]] λλλ1]]"),
     "nat->str": nat_to_str,
     "fac": dbn_to_srcexpr("λλ [[[1 λλ [0 [1 λλ [[2 1] [1 0]]]]] λ1] λ0]"),
+    "car": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcBool(True))),
+    "cdr": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcBool(False))),
+    "fst": SrcVar("car"),
+    "snd": SrcVar("cdr"),
+    "list-ref": list_ref,
 }
 
 @dataclass
 class SrcRoot(SrcExpr):
     """Root node of a program. Finds all builtin values the program references
-    and adds bindings for them, then binds gro and put."""
+    and adds bindings for them, then binds input (gro) and output."""
 
     block: SrcExpr
 
-    def simplify(self):
-        # find all builtins used
-        def get_referenced_builtins(expr: SrcExpr) -> frozenset[str]:
-            used_by_expr = expr.get_references() & frozenset(builtins.keys())
+    def simplify(self) -> SimpleExpr:
+        simplified_block = self.block.simplify()
 
-            # built-ins may refer to other built-ins
-            used_by_builtins = (get_referenced_builtins(builtins[name]) for name in used_by_expr)
-            return frozenset.union(used_by_expr, *(used_by_builtins))
+        builtin_defines = []
 
-        # sort since frozenset order isn't guaranteed (cause Python hashes are
-        # nondeterministic!?)
-        referenced_builtins = sorted(list(get_referenced_builtins(self.block)))
+        expr = SrcBlock([simplified_block]).simplify()
 
-        builtin_defines = [
-            SrcDefine(name, builtins[name])
-            for name in referenced_builtins
-        ]
+        # The very act of defining a builtin may introduce other builtins, so
+        # we have to repeatedly define builtins and re-check the entire root
+        # block until there are no more undefined builtins
+        while undefined_builtins := expr.get_references() & frozenset(builtins.keys()):
+            # sort since frozenset order isn't guaranteed (cause Python hashes are
+            # nondeterministic!?)
+            for builtin in sorted(list(undefined_builtins)):
+                simplified_builtin = builtins[builtin].simplify()
+                builtin_defines.append(SrcDefine(builtin, simplified_builtin))
+            expr = SrcBlock([*builtin_defines, simplified_block]).simplify()
 
-        body = SrcBlock([
-            *builtin_defines,
-            self.block,
-        ])
+        print("Found builtins", [define.var_name for define in builtin_defines], file=sys.stderr)
 
-        return SrcAbs("gro", SrcAbs("put", body)).simplify()
+        return SrcAbs("input", SrcAbs("output", expr)).simplify()
 
 # def tokenize(s: str) -> Generator[str, None, None]
 #     # Adapted from
@@ -511,36 +581,109 @@ class SrcRoot(SrcExpr):
 # def parse(s: str) -> SrcExpr:
     # tokens = tokenize(s)
 
+def dbn_to_blc(dbn: str) -> str:
+    # fortified version of Justine's compile.sh
+
+    binary: List[str] = []
+
+    while dbn:
+        char = dbn[0]
+        if char == "λ":
+            binary.extend("00")
+            dbn = dbn[1:]
+        elif char == "[":
+            binary.extend("01")
+            dbn = dbn[1:]
+        elif index_match := re.search(r"^(\d+)(.*)", dbn):
+            index = int(index_match.group(1))
+            remainder = index_match.group(2)
+            binary.extend((index * "1") + "10")
+            dbn = remainder
+        else:
+            dbn = dbn[1:]
+
+    return "".join(binary)
+
+def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
+    blc = dbn_to_blc(dbn)
+    Blc = run(["justine/asc2bin.com"], input=blc.encode("utf-8"), stdout=PIPE).stdout
+
+    if capture:
+        p = run(["justine/lambda.com", "-b"], input=Blc + input.encode("utf-8"), stdout=PIPE)
+        return p.stdout.decode("utf-8")
+    else:
+        run(["justine/lambda.com", "-b"], input=Blc + input.encode("utf-8"))
+        return None
+
+def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Optional[str]:
+    return exec_dbn(srcexpr.compile({}).to_dbn(), input, capture)
+
 if __name__ == "__main__":
-    nil = "λλ 0"
-    omega = "λ [0 0]"
-    
-    # Example program to reverse the input string
-    # dbn = f"""λ [[0 [{omega}
-    #    λλλλ [[1 [3 3]] λ [[0 3] 1]]]]
-    # {nil}]"""
-
-    # srcexpr, _ = dbn_to_srcexpr(dbn)
-
     # Fibonacci example with direct recursion
-    fib = SrcAbs("n",
-        SrcCall(SrcVar("if"), [
-                SrcCall(SrcVar("<="), [SrcVar("n"), SrcNat(2)]),
-                SrcNat(1),
-                SrcCall(SrcVar("+"), [
-                    SrcApp(SrcVar("fib"), SrcApp(SrcVar("--"), SrcVar("n"))),
-                    SrcApp(SrcVar("fib"), SrcCall(SrcVar("-"), [SrcVar("n"), SrcNat(2)])),
-                ])
-            ]
-        )
-    )
+    # fib = SrcAbs("n",
+    #     SrcCall(SrcVar("if"), [
+    #             SrcCall(SrcVar("<="), [SrcVar("n"), SrcNat(2)]),
+    #             SrcNat(1),
+    #             SrcCall(SrcVar("+"), [
+    #                 SrcApp(SrcVar("fib"), SrcApp(SrcVar("--"), SrcVar("n"))),
+    #                 SrcApp(SrcVar("fib"), SrcCall(SrcVar("-"), [SrcVar("n"), SrcNat(2)])),
+    #             ])
+    #         ]
+    #     )
+    # )
+    # srcexpr = SrcRoot(
+    #     SrcBlock([
+    #         SrcDefine("fib", fib),
+    #         SrcApp(SrcVar("print"),
+    #             SrcApp(SrcVar("nat->str"), SrcApp(SrcVar("fib"), SrcNat(8))))
+    #     ])
+    # )
 
-    srcexpr = SrcRoot(
-        SrcBlock([
-            SrcDefine("fib", fib),
-            SrcApp(SrcVar("print"), SrcApp(SrcVar("nat->str"), SrcApp(SrcVar("fib"), SrcNat(8)))),
+    # Even-odd example with mutual recursion 
+    even = SrcAbs("n",
+        SrcCall(SrcVar("is-zero"), [
+            SrcVar("n"),
+            SrcBool(True),
+            SrcApp(SrcVar("odd"), SrcApp(SrcVar("--"), SrcVar("n")))
+        ])
+    )
+    odd = SrcAbs("n",
+        SrcCall(SrcVar("is-zero"), [
+            SrcVar("n"),
+            SrcBool(False),
+            SrcApp(SrcVar("even"), SrcApp(SrcVar("--"), SrcVar("n")))
         ])
     )
 
+    n = 9
+    srcexpr = SrcRoot(
+        SrcBlock([
+            SrcDefine("odd", odd),
+            SrcDefine("even", even),
+            SrcApp(SrcVar("print"),
+                SrcCall(SrcApp(SrcVar("even"), SrcNat(n)), [
+                    SrcStr("even"),
+                    SrcStr("odd"),
+                ])
+            ),
+            SrcApp(SrcVar("print"), SrcStr("\n"))
+        ])
+    )
+
+    # Print nth char of input
+    # n = 4
+    # srcexpr = SrcRoot(
+    #     SrcBlock([
+    #         SrcApp(SrcVar("print"),
+    #             SrcList([
+    #                 SrcCall(SrcVar("list-ref"), [SrcVar("input"), SrcNat(n)]),
+    #             ])
+    #         ),
+    #         SrcApp(SrcVar("print"), SrcStr("\n"))
+    #     ])
+    # )
+
     tgtexpr = srcexpr.compile({})
-    print(tgtexpr.to_dbn())
+    dbn = tgtexpr.to_dbn()
+    print(dbn)
+    # exec_dbn(tgtexpr.to_dbn())
