@@ -3,7 +3,6 @@
 """
 TODO list
     typing?
-    tune stack parameter in Blc.S to allow executing larger programs
     parsing
     nice builtin library
         https://en.wikipedia.org/wiki/Church_encoding#Signed_numbers
@@ -23,6 +22,15 @@ import sys
 import re
 from uuid import uuid4
 from subprocess import run, PIPE
+
+# Raise the stack limit or we hit the maximum recursion depth, maybe Python was
+# a bad choice
+import resource, sys
+resource.setrlimit(resource.RLIMIT_STACK, (2**29,-1))
+sys.setrecursionlimit(10**6)
+
+# Use our build of the Blc interpreter
+PATH_TO_BLC_INTERPRETER = "./lambda"
 
 # For reasoning about indirect recursion
 import networkx as nx
@@ -609,10 +617,10 @@ def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
     Blc = run(["justine/asc2bin.com"], input=blc.encode("utf-8"), stdout=PIPE).stdout
 
     if capture:
-        p = run(["justine/lambda.com", "-b"], input=Blc + input.encode("utf-8"), stdout=PIPE)
+        p = run([PATH_TO_BLC_INTERPRETER, "-b"], input=Blc + input.encode("utf-8"), stdout=PIPE)
         return p.stdout.decode("utf-8")
     else:
-        run(["justine/lambda.com", "-b"], input=Blc + input.encode("utf-8"))
+        run([PATH_TO_BLC_INTERPRETER, "-b"], input=Blc + input.encode("utf-8"))
         return None
 
 def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Optional[str]:

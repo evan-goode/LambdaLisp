@@ -74,7 +74,7 @@ def test_even_odd():
             ])
         )
 
-    check_output(print_even_odd(9), "", "odd\n")
+    check_output(print_even_odd(151), "", "odd\n")
     check_output(print_even_odd(21), "", "odd\n")
     check_output(print_even_odd(12), "", "even\n")
     check_output(print_even_odd(0), "", "even\n")
