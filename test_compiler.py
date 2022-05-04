@@ -82,12 +82,12 @@ def test_even_odd():
 def test_even_odd_parse():
     even_odd = '''
 (define odd
-    (lambda n (if (is-zero n) #f (odd (-- n)))))
+    (lambda n (if (is-zero n) #f (even (-- n)))))
 (define even
-    (lambda n (if (is-zero n) #t (even (-- n)))))
-(if (even 8)
+    (lambda n (if (is-zero n) #t (odd (-- n)))))
+(if (even 3)
     (print "even")
     (print "odd"))
     '''
 
-    check_output(parse(even_odd), "", "even")
+    check_output(parse(even_odd), "", "odd")

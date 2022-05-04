@@ -874,6 +874,8 @@ def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
     blc = dbn_to_blc(dbn)
     Blc = run(["justine/asc2bin.com"], input=blc.encode("utf-8"), stdout=PIPE).stdout
 
+    print("Output is ", len(Blc), "bytes.", file=sys.stderr)
+
     if capture:
         p = run([PATH_TO_BLC_INTERPRETER, "-b"], input=Blc + input.encode("utf-8"), stdout=PIPE)
         return p.stdout.decode("utf-8")
