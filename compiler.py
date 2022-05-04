@@ -652,6 +652,13 @@ class ParseBlock(ParseExpr):
         return SrcBlock([statement.to_srcexpr() for statement in self.statements])
 
 @dataclass
+class ParseList(ParseExpr):
+    elements: Sequence[ParseExpr]
+
+    def to_srcexpr(self) -> SrcExpr:
+        return SrcList([element.to_srcexpr() for element in self.elements])
+
+@dataclass
 class ParseTree(ParseExpr):
     children: Sequence[ParseExpr]
 
@@ -744,7 +751,7 @@ class ParseTree(ParseExpr):
 
 
 # From https://norvig.com/lispy2.html
-tokenizer = r'''\s*(,@|[('`,)]|"(?:\\.|[^"\\])*"|;.*|[^\s(";)]*)(.*)'''
+tokenizer = r'''\s*(,@|[()[\]]|"(?:\\.|[^"\\])*"|;.*|[^\s(";)[\]]*)(.*)'''
 
 def tokenize(src: str) -> Generator[Token, None, None]:
     index = 0
@@ -771,8 +778,8 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
     # https://norvig.com/lispy2.html
 
     def read_ahead(token: Token) -> ParseExpr:
-        if token.s == ")":
-            raise ParseError("Unexpected ')'", token.start)
+        if token.s in ")}]":
+            raise ParseError(f"Unexpected '{token.s}'", token.start)
         if token.s == "(":
             children = []
 
@@ -787,6 +794,14 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
                 statements.append(read_ahead(t))
 
             return ParseBlock(token.start, t.end, statements)
+
+        if token.s == "[":
+            elements = []
+
+            while (t := next(tokens)).s != "]":
+                elements.append(read_ahead(t))
+
+            return ParseList(token.start, t.end, elements)
 
         if token.s in reserved_words:
             return ParseReserved(token.start, token.end, token.s)
@@ -873,7 +888,7 @@ def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Option
 if __name__ == "__main__":
     src = '''
     (define (double) (lambda x (+ x x))) 
-    (print (nat->str (double 1 )))(
+    (print (nat->str (double (list-ref [1 19] 1))))
     '''
 
     try:
