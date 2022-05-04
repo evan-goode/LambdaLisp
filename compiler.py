@@ -22,6 +22,7 @@ import sys
 import re
 from uuid import uuid4
 from subprocess import run, PIPE
+from ast import literal_eval
 
 # For reasoning about indirect recursion
 import networkx as nx
@@ -540,6 +541,8 @@ builtins = {
     "fst": SrcVar("car"),
     "snd": SrcVar("cdr"),
     "list-ref": list_ref,
+    "#t": SrcBool(True),
+    "#f": SrcBool(False),
 }
 
 @dataclass
@@ -575,7 +578,8 @@ class SrcRoot(SrcExpr):
 
 @dataclass
 class Token:
-    span: range
+    start: int
+    end: int
     s: str
 
 class ParseError(Exception):
@@ -588,19 +592,22 @@ class ParseError(Exception):
             c = 0
             for line_number, line in enumerate(src.splitlines()):
                 if c <= self.index < c + len(line):
+                    char = self.index - c
+                    padding = len(line[:char].expandtabs(8))
                     return "\n".join((
                         f"Parse error, line {line_number}:",
                         self.message,
                         line,
-                        " " * self.index + "^",
+                        " " * padding + "^",
                     ))
-                c += len(line)
+                c += len(line) + 1 # for newline
         return f"Parse error:\n{self.message}"
 
 # https://github.com/python/mypy/issues/5374
 @dataclass # type: ignore[misc] 
 class ParseExpr(ABC):
-    span: range
+    start: int
+    end: int
 
     @abstractmethod
     def to_srcexpr(self) -> SrcExpr:
@@ -610,28 +617,28 @@ class ParseExpr(ABC):
         return self
 
 @dataclass
-class AtomReserved(ParseExpr):
+class ParseReserved(ParseExpr):
     s: str
 
     def to_srcexpr(self) -> SrcExpr:
-        raise ParseError("Unexpected reserved word!", self.span.start)
+        raise ParseError("Unexpected reserved word!", self.start)
 
 @dataclass
-class AtomNat(ParseExpr):
+class ParseNat(ParseExpr):
     value: int
 
     def to_srcexpr(self) -> SrcExpr:
         return SrcNat(self.value)
 
 @dataclass
-class AtomSymbol(ParseExpr):
+class ParseSymbol(ParseExpr):
     s: str
 
     def to_srcexpr(self) -> SrcExpr:
         return SrcVar(self.s)
 
 @dataclass
-class AtomStr(ParseExpr):
+class ParseStr(ParseExpr):
     s: str
 
     def to_srcexpr(self) -> SrcExpr:
@@ -657,41 +664,41 @@ class ParseTree(ParseExpr):
         var_symbols = self.children[1]
         var_names: List[str] = []
 
-        if isinstance(var_symbols, AtomSymbol):
+        if isinstance(var_symbols, ParseSymbol):
             # lambda with a single argument
             var_names.append(var_symbols.s)
         elif isinstance(var_symbols, ParseTree):
             for var_symbol in var_symbols.children:
-                if not isinstance(var_symbol, AtomSymbol):
-                    raise ParseError("Expected parameter name!", var_symbol.span.start)
+                if not isinstance(var_symbol, ParseSymbol):
+                    raise ParseError("Expected parameter name!", var_symbol.start)
                 var_names.append(var_symbol.s)
         else:
-            raise ParseError("Expected parameter list to follow 'lambda'!", var_symbol.span.start)
+            raise ParseError("Expected parameter list to follow 'lambda'!", var_symbol.start)
 
         try:
             body = self.children[2]
         except IndexError as e:
-            raise ParseError("Expected 'lambda' body!", self.span.stop) from e
+            raise ParseError("Expected 'lambda' body!", self.end) from e
 
         return SrcLambda(var_names, body.to_srcexpr())
 
     def let_to_srcexpr(self) -> SrcExpr:
         var_symbol = self.children[1]
 
-        if not isinstance(var_symbol, AtomSymbol):
-            raise ParseError("Expected variable name!", var_symbol.span.start)
+        if not isinstance(var_symbol, ParseSymbol):
+            raise ParseError("Expected variable name!", var_symbol.start)
         
         var_name = var_symbol.s
 
         try:
             value = self.children[2]
         except IndexError as e:
-            raise ParseError("Expected bound value!", self.span.stop) from e
+            raise ParseError("Expected bound value!", self.end) from e
 
         try:
             body = self.children[3]
         except IndexError as e:
-            raise ParseError("Expected 'let' body!", self.span.stop) from e
+            raise ParseError("Expected 'let' body!", self.end) from e
 
         binding = (var_name, value.to_srcexpr())
         return SrcLet([binding], body.to_srcexpr())
@@ -700,15 +707,15 @@ class ParseTree(ParseExpr):
         # same as let_to_srcexpr
         var_symbol = self.children[1]
 
-        if not isinstance(var_symbol, AtomSymbol):
-            raise ParseError("Expected variable name!", var_symbol.span.start)
+        if not isinstance(var_symbol, ParseSymbol):
+            raise ParseError("Expected variable name!", var_symbol.start)
         
         var_name = var_symbol.s
 
         try:
             value = self.children[2]
         except IndexError as e:
-            raise ParseError("Expected defined value!", self.span.stop) from e
+            raise ParseError("Expected defined value!", self.end) from e
 
         return SrcDefine(var_name, value.to_srcexpr())
 
@@ -719,7 +726,7 @@ class ParseTree(ParseExpr):
         if len(self.children) == 1:
             return self.children[0].to_srcexpr()
 
-        if isinstance(self.children[0], AtomReserved):
+        if isinstance(self.children[0], ParseReserved):
             word = self.children[0].s
 
             if word == "lambda":
@@ -729,36 +736,34 @@ class ParseTree(ParseExpr):
             if word == "define":
                 return self.define_to_srcexpr()
                 
-            raise ParseError("Unknown word!", self.children[0].span.start)
+            raise ParseError("Unknown word!", self.children[0].start)
 
         func = self.children[0].to_srcexpr()
         args = [child.to_srcexpr() for child in self.children[1:]]
         return SrcCall(func, args)
 
 
+# From https://norvig.com/lispy2.html
+tokenizer = r'''\s*(,@|[('`,)]|"(?:\\.|[^"\\])*"|;.*|[^\s(";)]*)(.*)'''
+
 def tokenize(src: str) -> Generator[Token, None, None]:
-    # Adapted from
-    # https://stackoverflow.com/questions/45975769/lisp-tokenizer-from-character-stream-in-python#45978180
+    index = 0
 
-    current_word_start = 0
+    while src_match := re.match(tokenizer, src, flags=re.DOTALL):
+        token_str, src = src_match.groups()
+        token_span, remaining_span = src_match.span(1), src_match.span(2)
 
-    # store as an list of characters since Python strings are immutable
-    current_word: List[str] = []
+        if remaining_span[0] == 0:
+            raise ParseError("Unexpected character", index)
 
-    for i, c in enumerate(src):
-        is_paren = c in "()"
-        is_separator = c.isspace() or is_paren
-        if not is_separator:
-            if not current_word:
-                current_word_start = i
-            current_word.append(c)
-        else:
-            if current_word:
-                value = "".join(current_word)
-                yield Token(range(current_word_start, i + 1), value)
-                current_word = []
-            if is_paren:
-                yield Token(range(i, i + 1), c)
+        if token_str != "":
+            yield Token(index + token_span[0], index + token_span[1], token_str)
+
+        index += remaining_span[0]
+
+        if not src:
+            return
+        old_src = src
 
 reserved_words = {"lambda", "define", "let"}
 
@@ -767,35 +772,40 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
 
     def read_ahead(token: Token) -> ParseExpr:
         if token.s == ")":
-            raise ParseError("Unexpected ')'", token.span.start)
+            raise ParseError("Unexpected ')'", token.start)
         if token.s == "(":
             children = []
 
             while (t := next(tokens)).s != ")":
                 children.append(read_ahead(t))
 
-            return ParseTree(range(token.span.start, t.span.stop), children).collapse()
+            return ParseTree(token.start, t.end, children).collapse()
         if token.s == "{":
             statements = []
 
             while (t := next(tokens)).s != "}":
                 statements.append(read_ahead(t))
 
-            return ParseBlock(range(token.span.start, t.span.stop), statements)
+            return ParseBlock(token.start, t.end, statements)
 
         if token.s in reserved_words:
-            return AtomReserved(token.span, token.s)
+            return ParseReserved(token.start, token.end, token.s)
 
         if nat_match := re.search(r"^(\d+)(.*)", token.s):
             value = int(nat_match.group(1))
             remainder = nat_match.group(2)
 
             if remainder:
-                index = token.span.start + nat_match.span(2)[0]
+                index = token.start + nat_match.span(2)[0]
                 raise ParseError(f"Unexpected character while parsing nat!", index)
-            return AtomNat(token.span, value)
+            return ParseNat(token.start, token.end, value)
 
-        return AtomSymbol(token.span, token.s)
+        if str_match := re.search(r'''^"((?:\\.|[^"\\])*)"$''', token.s):
+            escaped = str_match.group(0)
+            unescaped = literal_eval(escaped)
+            return ParseStr(token.start, token.end, unescaped)
+
+        return ParseSymbol(token.start, token.end, token.s)
 
     return read_ahead(next(tokens))
 
@@ -816,7 +826,7 @@ def parse(src: str) -> SrcExpr:
         except StopIteration:
             break
 
-    srcexpr = ParseBlock(range(len(src)), statements).to_srcexpr()
+    srcexpr = ParseBlock(0, len(src), statements).to_srcexpr()
 
     return SrcRoot(srcexpr)
 
@@ -861,83 +871,13 @@ def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Option
     return exec_dbn(srcexpr.compile({}).to_dbn(), input, capture)
 
 if __name__ == "__main__":
-    # Fibonacci example with direct recursion
-    # fib = SrcAbs("n",
-    #     SrcCall(SrcVar("if"), [
-    #             SrcCall(SrcVar("<="), [SrcVar("n"), SrcNat(2)]),
-    #             SrcNat(1),
-    #             SrcCall(SrcVar("+"), [
-    #                 SrcApp(SrcVar("fib"), SrcApp(SrcVar("--"), SrcVar("n"))),
-    #                 SrcApp(SrcVar("fib"), SrcCall(SrcVar("-"), [SrcVar("n"), SrcNat(2)])),
-    #             ])
-    #         ]
-    #     )
-    # )
-    # srcexpr = SrcRoot(
-    #     SrcBlock([
-    #         SrcDefine("fib", fib),
-    #         SrcApp(SrcVar("print"),
-    #             SrcApp(SrcVar("nat->str"), SrcApp(SrcVar("fib"), SrcNat(8))))
-    #     ])
-    # )
-
-    # Even-odd example with mutual recursion 
-    # even = SrcAbs("n",
-    #     SrcCall(SrcVar("is-zero"), [
-    #         SrcVar("n"),
-    #         SrcBool(True),
-    #         SrcApp(SrcVar("odd"), SrcApp(SrcVar("--"), SrcVar("n")))
-    #     ])
-    # )
-    # odd = SrcAbs("n",
-    #     SrcCall(SrcVar("is-zero"), [
-    #         SrcVar("n"),
-    #         SrcBool(False),
-    #         SrcApp(SrcVar("even"), SrcApp(SrcVar("--"), SrcVar("n")))
-    #     ])
-    # )
-
-    # n = 9
-    # srcexpr = SrcRoot(
-    #     SrcBlock([
-    #         SrcDefine("odd", odd),
-    #         SrcDefine("even", even),
-    #         SrcApp(SrcVar("print"),
-    #             SrcCall(SrcApp(SrcVar("even"), SrcNat(n)), [
-    #                 SrcStr("even"),
-    #                 SrcStr("odd"),
-    #             ])
-    #         ),
-    #         SrcApp(SrcVar("print"), SrcStr("\n"))
-    #     ])
-    # )
-
-    # Print nth char of input
-    # n = 4
-    # srcexpr = SrcRoot(
-    #     SrcBlock([
-    #         SrcApp(SrcVar("print"),
-    #             SrcList([
-    #                 SrcCall(SrcVar("list-ref"), [SrcVar("input"), SrcNat(n)]),
-    #             ])
-    #         ),
-    #         SrcApp(SrcVar("print"), SrcStr("\n"))
-    #     ])
-    # )
-
-    # tgtexpr = srcexpr.compile({})
-    # dbn = tgtexpr.to_dbn()
-    # print(dbn)
-    # exec_dbn(tgtexpr.to_dbn())
-
-    src = """
+    src = '''
     (define (double) (lambda x (+ x x))) 
-    (print (nat->str (double 1)))
-    """
+    (print (nat->str (double 1 )))(
+    '''
 
     try:
         srcexpr = parse(src)
-        print(srcexpr)
         exec_srcexpr(parse(src))
     except ParseError as e:
         print(e.format(src), file=sys.stderr)
