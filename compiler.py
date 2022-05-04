@@ -15,13 +15,18 @@ TODO list
 
 # "A language targeting SectorLambda sounds super cool." -Justine Tunney
 
-from typing import Dict, Tuple, List, FrozenSet, Optional
+from typing import Dict, Generator, Iterator, Tuple, NamedTuple, List, FrozenSet, Optional, Sequence
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import sys
 import re
 from uuid import uuid4
 from subprocess import run, PIPE
+
+# For reasoning about indirect recursion
+import networkx as nx
+
+from more_itertools import peekable
 
 # Raise the stack limit or we hit the maximum recursion depth, maybe Python was
 # a bad choice
@@ -32,8 +37,6 @@ sys.setrecursionlimit(10**6)
 # Use our build of the Blc interpreter
 PATH_TO_BLC_INTERPRETER = "./lambda"
 
-# For reasoning about indirect recursion
-import networkx as nx
 
 # Target language (de Bruijn notation Blc)
 class TgtExpr(ABC):
@@ -568,26 +571,255 @@ class SrcRoot(SrcExpr):
 
         return SrcAbs("input", SrcAbs("output", expr)).simplify()
 
-# def tokenize(s: str) -> Generator[str, None, None]
-#     # Adapted from
-#     # https://stackoverflow.com/questions/45975769/lisp-tokenizer-from-character-stream-in-python#45978180
+# Parsing
 
-#     # store as an list of characters since strings are immutable
-#     current_word = []
-#     for c in s:
-#         is_paren = c in "()"
-#         is_separator = c.isspace() or is_paren
-#         if not is_separator:
-#             current_word.append(c)
-#         else:
-#             if current_word:
-#                 yield "".join(current_word)
-#                 current_word = []
-#             if is_paren:
-#                 yield c
+@dataclass
+class Token:
+    span: range
+    s: str
 
-# def parse(s: str) -> SrcExpr:
-    # tokens = tokenize(s)
+class ParseError(Exception):
+    def __init__(self, message: str, index: Optional[int]=None):
+        super().__init__(message)
+        self.message = message
+        self.index = index
+    def format(self, src: str) -> str:
+        if self.index is not None:
+            c = 0
+            for line_number, line in enumerate(src.splitlines()):
+                if c <= self.index < c + len(line):
+                    return "\n".join((
+                        f"Parse error, line {line_number}:",
+                        self.message,
+                        line,
+                        " " * self.index + "^",
+                    ))
+                c += len(line)
+        return f"Parse error:\n{self.message}"
+
+# https://github.com/python/mypy/issues/5374
+@dataclass # type: ignore[misc] 
+class ParseExpr(ABC):
+    span: range
+
+    @abstractmethod
+    def to_srcexpr(self) -> SrcExpr:
+        pass
+
+    def collapse(self) -> "ParseExpr":
+        return self
+
+@dataclass
+class AtomReserved(ParseExpr):
+    s: str
+
+    def to_srcexpr(self) -> SrcExpr:
+        raise ParseError("Unexpected reserved word!", self.span.start)
+
+@dataclass
+class AtomNat(ParseExpr):
+    value: int
+
+    def to_srcexpr(self) -> SrcExpr:
+        return SrcNat(self.value)
+
+@dataclass
+class AtomSymbol(ParseExpr):
+    s: str
+
+    def to_srcexpr(self) -> SrcExpr:
+        return SrcVar(self.s)
+
+@dataclass
+class AtomStr(ParseExpr):
+    s: str
+
+    def to_srcexpr(self) -> SrcExpr:
+        return SrcStr(self.s)
+
+@dataclass
+class ParseBlock(ParseExpr):
+    statements: Sequence[ParseExpr]
+
+    def to_srcexpr(self) -> SrcExpr:
+        return SrcBlock([statement.to_srcexpr() for statement in self.statements])
+
+@dataclass
+class ParseTree(ParseExpr):
+    children: Sequence[ParseExpr]
+
+    def collapse(self) -> ParseExpr:
+        if len(self.children) == 1:
+            return self.children[0].collapse()
+        return self
+
+    def lambda_to_srcexpr(self) -> SrcExpr:
+        var_symbols = self.children[1]
+        var_names: List[str] = []
+
+        if isinstance(var_symbols, AtomSymbol):
+            # lambda with a single argument
+            var_names.append(var_symbols.s)
+        elif isinstance(var_symbols, ParseTree):
+            for var_symbol in var_symbols.children:
+                if not isinstance(var_symbol, AtomSymbol):
+                    raise ParseError("Expected parameter name!", var_symbol.span.start)
+                var_names.append(var_symbol.s)
+        else:
+            raise ParseError("Expected parameter list to follow 'lambda'!", var_symbol.span.start)
+
+        try:
+            body = self.children[2]
+        except IndexError as e:
+            raise ParseError("Expected 'lambda' body!", self.span.stop) from e
+
+        return SrcLambda(var_names, body.to_srcexpr())
+
+    def let_to_srcexpr(self) -> SrcExpr:
+        var_symbol = self.children[1]
+
+        if not isinstance(var_symbol, AtomSymbol):
+            raise ParseError("Expected variable name!", var_symbol.span.start)
+        
+        var_name = var_symbol.s
+
+        try:
+            value = self.children[2]
+        except IndexError as e:
+            raise ParseError("Expected bound value!", self.span.stop) from e
+
+        try:
+            body = self.children[3]
+        except IndexError as e:
+            raise ParseError("Expected 'let' body!", self.span.stop) from e
+
+        binding = (var_name, value.to_srcexpr())
+        return SrcLet([binding], body.to_srcexpr())
+
+    def define_to_srcexpr(self) -> SrcExpr:
+        # same as let_to_srcexpr
+        var_symbol = self.children[1]
+
+        if not isinstance(var_symbol, AtomSymbol):
+            raise ParseError("Expected variable name!", var_symbol.span.start)
+        
+        var_name = var_symbol.s
+
+        try:
+            value = self.children[2]
+        except IndexError as e:
+            raise ParseError("Expected defined value!", self.span.stop) from e
+
+        return SrcDefine(var_name, value.to_srcexpr())
+
+    def to_srcexpr(self) -> SrcExpr:
+        if not self.children:
+            return SrcNil()
+
+        if len(self.children) == 1:
+            return self.children[0].to_srcexpr()
+
+        if isinstance(self.children[0], AtomReserved):
+            word = self.children[0].s
+
+            if word == "lambda":
+                return self.lambda_to_srcexpr()
+            if word == "let":
+                return self.let_to_srcexpr()
+            if word == "define":
+                return self.define_to_srcexpr()
+                
+            raise ParseError("Unknown word!", self.children[0].span.start)
+
+        func = self.children[0].to_srcexpr()
+        args = [child.to_srcexpr() for child in self.children[1:]]
+        return SrcCall(func, args)
+
+
+def tokenize(src: str) -> Generator[Token, None, None]:
+    # Adapted from
+    # https://stackoverflow.com/questions/45975769/lisp-tokenizer-from-character-stream-in-python#45978180
+
+    current_word_start = 0
+
+    # store as an list of characters since Python strings are immutable
+    current_word: List[str] = []
+
+    for i, c in enumerate(src):
+        is_paren = c in "()"
+        is_separator = c.isspace() or is_paren
+        if not is_separator:
+            if not current_word:
+                current_word_start = i
+            current_word.append(c)
+        else:
+            if current_word:
+                value = "".join(current_word)
+                yield Token(range(current_word_start, i + 1), value)
+                current_word = []
+            if is_paren:
+                yield Token(range(i, i + 1), c)
+
+reserved_words = {"lambda", "define", "let"}
+
+def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
+    # https://norvig.com/lispy2.html
+
+    def read_ahead(token: Token) -> ParseExpr:
+        if token.s == ")":
+            raise ParseError("Unexpected ')'", token.span.start)
+        if token.s == "(":
+            children = []
+
+            while (t := next(tokens)).s != ")":
+                children.append(read_ahead(t))
+
+            return ParseTree(range(token.span.start, t.span.stop), children).collapse()
+        if token.s == "{":
+            statements = []
+
+            while (t := next(tokens)).s != "}":
+                statements.append(read_ahead(t))
+
+            return ParseBlock(range(token.span.start, t.span.stop), statements)
+
+        if token.s in reserved_words:
+            return AtomReserved(token.span, token.s)
+
+        if nat_match := re.search(r"^(\d+)(.*)", token.s):
+            value = int(nat_match.group(1))
+            remainder = nat_match.group(2)
+
+            if remainder:
+                index = token.span.start + nat_match.span(2)[0]
+                raise ParseError(f"Unexpected character while parsing nat!", index)
+            return AtomNat(token.span, value)
+
+        return AtomSymbol(token.span, token.s)
+
+    return read_ahead(next(tokens))
+
+
+def parse(src: str) -> SrcExpr:
+    tokens = peekable(tokenize(src))
+
+    statements: List[ParseExpr] = []
+
+    while True:
+        try:
+            statements.append(tokens_to_parseexpr(src, tokens))
+        except StopIteration:
+            raise ParseError("Unexpected end of input. Maybe an unmatched '('?")
+        
+        try:
+            tokens.peek()
+        except StopIteration:
+            break
+
+    srcexpr = ParseBlock(range(len(src)), statements).to_srcexpr()
+
+    return SrcRoot(srcexpr)
+
 
 def dbn_to_blc(dbn: str) -> str:
     # fortified version of Justine's compile.sh
@@ -612,6 +844,7 @@ def dbn_to_blc(dbn: str) -> str:
 
     return "".join(binary)
 
+
 def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
     blc = dbn_to_blc(dbn)
     Blc = run(["justine/asc2bin.com"], input=blc.encode("utf-8"), stdout=PIPE).stdout
@@ -622,6 +855,7 @@ def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
     else:
         run([PATH_TO_BLC_INTERPRETER, "-b"], input=Blc + input.encode("utf-8"))
         return None
+
 
 def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Optional[str]:
     return exec_dbn(srcexpr.compile({}).to_dbn(), input, capture)
@@ -648,35 +882,35 @@ if __name__ == "__main__":
     # )
 
     # Even-odd example with mutual recursion 
-    even = SrcAbs("n",
-        SrcCall(SrcVar("is-zero"), [
-            SrcVar("n"),
-            SrcBool(True),
-            SrcApp(SrcVar("odd"), SrcApp(SrcVar("--"), SrcVar("n")))
-        ])
-    )
-    odd = SrcAbs("n",
-        SrcCall(SrcVar("is-zero"), [
-            SrcVar("n"),
-            SrcBool(False),
-            SrcApp(SrcVar("even"), SrcApp(SrcVar("--"), SrcVar("n")))
-        ])
-    )
+    # even = SrcAbs("n",
+    #     SrcCall(SrcVar("is-zero"), [
+    #         SrcVar("n"),
+    #         SrcBool(True),
+    #         SrcApp(SrcVar("odd"), SrcApp(SrcVar("--"), SrcVar("n")))
+    #     ])
+    # )
+    # odd = SrcAbs("n",
+    #     SrcCall(SrcVar("is-zero"), [
+    #         SrcVar("n"),
+    #         SrcBool(False),
+    #         SrcApp(SrcVar("even"), SrcApp(SrcVar("--"), SrcVar("n")))
+    #     ])
+    # )
 
-    n = 9
-    srcexpr = SrcRoot(
-        SrcBlock([
-            SrcDefine("odd", odd),
-            SrcDefine("even", even),
-            SrcApp(SrcVar("print"),
-                SrcCall(SrcApp(SrcVar("even"), SrcNat(n)), [
-                    SrcStr("even"),
-                    SrcStr("odd"),
-                ])
-            ),
-            SrcApp(SrcVar("print"), SrcStr("\n"))
-        ])
-    )
+    # n = 9
+    # srcexpr = SrcRoot(
+    #     SrcBlock([
+    #         SrcDefine("odd", odd),
+    #         SrcDefine("even", even),
+    #         SrcApp(SrcVar("print"),
+    #             SrcCall(SrcApp(SrcVar("even"), SrcNat(n)), [
+    #                 SrcStr("even"),
+    #                 SrcStr("odd"),
+    #             ])
+    #         ),
+    #         SrcApp(SrcVar("print"), SrcStr("\n"))
+    #     ])
+    # )
 
     # Print nth char of input
     # n = 4
@@ -691,7 +925,19 @@ if __name__ == "__main__":
     #     ])
     # )
 
-    tgtexpr = srcexpr.compile({})
-    dbn = tgtexpr.to_dbn()
-    print(dbn)
+    # tgtexpr = srcexpr.compile({})
+    # dbn = tgtexpr.to_dbn()
+    # print(dbn)
     # exec_dbn(tgtexpr.to_dbn())
+
+    src = """
+    (define (double) (lambda x (+ x x))) 
+    (print (nat->str (double 1)))
+    """
+
+    try:
+        srcexpr = parse(src)
+        print(srcexpr)
+        exec_srcexpr(parse(src))
+    except ParseError as e:
+        print(e.format(src), file=sys.stderr)

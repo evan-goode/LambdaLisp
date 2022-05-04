@@ -2,3 +2,5 @@
 # https://justine.lol/ape.html and overwrite themselves with a
 # platform-specific binary, so ignore any changes to them
 justine/*.com
+
+__pycache__
