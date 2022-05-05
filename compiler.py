@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
 
-"""
-TODO list
-    typing?
-    parsing
-    nice builtin library
-        https://en.wikipedia.org/wiki/Church_encoding#Signed_numbers
-        nat->str
-        str->nat
-        map
-        reduce
-        sort would be cool
-"""
-
 # "A language targeting SectorLambda sounds super cool." -Justine Tunney
 
-from typing import Dict, Generator, Iterator, Tuple, NamedTuple, List, FrozenSet, Optional, Sequence
-from dataclasses import dataclass
 from abc import ABC, abstractmethod
-import sys
-import re
-from uuid import uuid4
-from subprocess import run, PIPE
 from ast import literal_eval
+from dataclasses import dataclass
+from subprocess import run, PIPE
+from typing import Dict, FrozenSet, Generator, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from uuid import uuid4
+import re
+import sys
 
 # For reasoning about indirect recursion
 import networkx as nx
@@ -32,8 +19,8 @@ from more_itertools import peekable
 # Raise the stack limit or we hit the maximum recursion depth, maybe Python was
 # a bad choice
 import resource, sys
-resource.setrlimit(resource.RLIMIT_STACK, (2**29,-1))
-sys.setrecursionlimit(10**6)
+resource.setrlimit(resource.RLIMIT_STACK, (2 ** 29, -1))
+sys.setrecursionlimit(10 ** 6)
 
 # Use our build of the Blc interpreter
 PATH_TO_BLC_INTERPRETER = "./lambda"
@@ -103,6 +90,7 @@ class SimpleExpr(SrcExpr):
 
     @abstractmethod
     def get_references(self) -> frozenset[str]:
+        """Get the set of variables the expression references"""
         pass
 
 @dataclass
@@ -213,31 +201,31 @@ class SrcCall(SrcExpr):
     function: SrcExpr
     arguments: List[SrcExpr]
 
-    def make_call(self, arguments: List[SrcExpr]) -> SrcExpr:
+    def _make_call(self, arguments: List[SrcExpr]) -> SrcExpr:
         if not arguments:
             return SrcApp(self.function, SrcNil())
         if len(arguments) == 1:
             return SrcApp(self.function, arguments[0])
-        return SrcApp(self.make_call(arguments[:-1]), arguments[-1])
+        return SrcApp(self._make_call(arguments[:-1]), arguments[-1])
 
     def simplify(self) -> SimpleExpr:
-        return self.make_call(self.arguments).simplify()
+        return self._make_call(self.arguments).simplify()
 
 @dataclass
 class SrcLambda(SrcExpr):
-    """TODO Function definition with multiple arguments"""
+    """Function definition with multiple arguments"""
     var_names: List[str]
     expr: SrcExpr
 
-    def make_lambda(self, var_names: List[str]) -> SrcExpr:
+    def _make_lambda(self, var_names: List[str]) -> SrcExpr:
         if not var_names:
             return SrcAnonAbs(self.expr)
         if len(var_names) == 1:
             return SrcAbs(var_names[0], self.expr)
-        return SrcAbs(var_names[0], self.make_lambda(var_names[1:]))
+        return SrcAbs(var_names[0], self._make_lambda(var_names[1:]))
 
     def simplify(self) -> SimpleExpr:
-        return self.make_lambda(self.var_names).simplify()
+        return self._make_lambda(self.var_names).simplify()
 
 @dataclass
 class SrcNat(SrcExpr):
@@ -248,17 +236,17 @@ class SrcNat(SrcExpr):
         if self.value < 0:
             raise ValueError("Nat cannot be less than 0!")
 
-    def make_nat(self, n: int) -> SrcExpr:
+    def _make_nat(self, n: int) -> SrcExpr:
         if n == 0:
             return SrcAnonVar(0)
         return SrcApp(
                 SrcAnonVar(1),
-                self.make_nat(n - 1)
+                self._make_nat(n - 1)
             )
 
     def simplify(self) -> SimpleExpr:
         return SrcAnonAbs(SrcAnonAbs(
-            self.make_nat(self.value)
+            self._make_nat(self.value)
         )).simplify()
 
 @dataclass
@@ -268,25 +256,6 @@ class SrcBool(SrcExpr):
 
     def simplify(self) -> SimpleExpr:
         return dbn_to_srcexpr(f"λλ {int(self.value)}")
-
-# Might want `pair` in the language rather than a builtin for type checking
-# purposes
-# @dataclass
-# class SrcPair(SrcExpr):
-#     a: SrcExpr
-#     b: SrcExpr
-    
-#     def get_references(self):
-#         return frozenset(("pair"),) | self.a.get_references() | self.b.get_references()
-
-#     def compile(self, context) -> TgtExpr:
-#         return SrcApp(
-#             SrcApp( 
-#                 SrcVar("pair"),
-#                 self.a
-#             ),
-#             self.b
-#         ).compile(context)
 
 @dataclass
 class SrcNil(SrcExpr):
@@ -301,7 +270,7 @@ class SrcList(SrcExpr):
     """List of elements, i.e. (pair a (pair b (pair c ...)))"""
     elements: List[SrcExpr]
 
-    def make_list(self, l: List[SrcExpr]) -> SrcExpr:
+    def _make_list(self, l: List[SrcExpr]) -> SrcExpr:
         if l == []:
             return SrcNil()
         return SrcAnonAbs(
@@ -310,12 +279,12 @@ class SrcList(SrcExpr):
                     SrcAnonVar(0),
                     l[0],
                 ),
-                self.make_list(l[1:])
+                self._make_list(l[1:])
             )
         )
 
     def simplify(self) -> SimpleExpr:
-        return self.make_list(self.elements).simplify()
+        return self._make_list(self.elements).simplify()
         
 @dataclass
 class SrcByte(SrcExpr):
@@ -348,23 +317,24 @@ class SrcDefine(SrcExpr):
 
 @dataclass
 class SrcLet(SrcExpr):
+    """Let binding with multiple variables"""
     bindings: List[Tuple[str, SrcExpr]]
     expr: SrcExpr
 
-    def make_let(self, bindings: List[Tuple[str, SrcExpr]]) -> SrcExpr:
+    def _make_let(self, bindings: List[Tuple[str, SrcExpr]]) -> SrcExpr:
         if bindings == []:
             return self.expr
         name, value = bindings[0]
         return SrcApp(
             SrcAbs(
                 name,
-                self.make_let(bindings[1:]),
+                self._make_let(bindings[1:]),
             ),
             value,
         )
 
     def simplify(self) -> SimpleExpr:
-        return self.make_let(self.bindings).simplify()
+        return self._make_let(self.bindings).simplify()
 
 @dataclass
 class SrcBlock(SrcExpr):
@@ -378,12 +348,12 @@ class SrcBlock(SrcExpr):
 
     # "Statements" will depend on the type system a bit. Each sequential
     # statement must evaluate to nil, otherwise behavior is undefined.
-    def make_sequence(self, statements: List[SrcExpr]) -> SrcExpr:
+    def _make_sequence(self, statements: List[SrcExpr]) -> SrcExpr:
         if not statements:
             return SrcVar("if")
         return SrcApp(
             statements[0],
-            self.make_sequence(statements[1:]),
+            self._make_sequence(statements[1:]),
         )
 
     def simplify(self) -> SimpleExpr:
@@ -491,12 +461,11 @@ class SrcBlock(SrcExpr):
         if bindings:
             return SrcLet(
                 bindings,
-                self.make_sequence(sequence)
+                self._make_sequence(sequence)
             ).simplify()
-        return self.make_sequence(sequence).simplify()
+        return self._make_sequence(sequence).simplify()
 
 # Built-in functions that are more "standard library" than "language feature"
-# TODO once parsing works, these can be defined in the source language.
 
 # Built-in functions can refer to other built-ins (or themselves) and SrcBlock
 # and SrcRoot will work out the recursion/dependencies.
@@ -530,7 +499,6 @@ builtins = {
     "-": dbn_to_srcexpr("λλ [[0 λλλ [[[2 λλ [0 [1 3]]] λ 1] λ 0]] 1]"),
     "min": dbn_to_srcexpr("λλλλ [[[3 λλ [0 1]] λ1] [[2 λλ [3 [0 1]]] λ1]]"),
     "/": dbn_to_srcexpr("λλλλ [[[3 λλ [0 1]] λ 1] [[3 λ [[[3 λλ [0 1]] λ [3 [0 1]]] λ0]] 0]]"),
-    # "%": dbn_to_srcexpr(""),
     "=": dbn_to_srcexpr("λλ [[[[1 λ [[0 λ0] λ0]] [[0 λλλ [1 2]] λλ0]] λλλ0] λλ1]"),
     "<=": dbn_to_srcexpr("λλ [[[1 λλ [0 1]] λλλ1] [[0 λλ [0 1]] λλλ0]]"),
     "<": dbn_to_srcexpr("λλ [[[0 λλ [0 1]] λλλ0] [[1 λλ [0 1]] λλλ1]]"),
@@ -576,24 +544,36 @@ class SrcRoot(SrcExpr):
 
 # Parsing
 
+# Source code => stream of tokens => ParseExpr (parse tree) => SrcExpr (AST)
+
 @dataclass
 class Token:
+    """A """
     start: int
     end: int
     s: str
 
 class ParseError(Exception):
+    """Error during some part of the parsing process."""
     def __init__(self, message: str, index: Optional[int]=None):
         super().__init__(message)
         self.message = message
         self.index = index
     def format(self, src: str) -> str:
+        """Given the original source code, `src`, format a nice error message
+        that has the line with the error and a '^' pointing to where it
+        happened."""
         if self.index is not None:
             c = 0
+            # loop through lines until we find which line `index` is on
             for line_number, line in enumerate(src.splitlines()):
                 if c <= self.index < c + len(line):
                     char = self.index - c
+
+                    # handle indentation with tabs: len("\t") is 1, but it will
+                    # be printed as 8 characters
                     padding = len(line[:char].expandtabs(8))
+
                     return "\n".join((
                         f"Parse error, line {line_number}:",
                         self.message,
@@ -621,6 +601,7 @@ class ParseReserved(ParseExpr):
     s: str
 
     def to_srcexpr(self) -> SrcExpr:
+        # A reserved word like "define" should never appear by itself
         raise ParseError("Unexpected reserved word!", self.start)
 
 @dataclass
@@ -663,18 +644,22 @@ class ParseTree(ParseExpr):
     children: Sequence[ParseExpr]
 
     def collapse(self) -> ParseExpr:
+        """Collapse a tree with 1 child down to just its child. Reduces
+        ((BLAH)) to just BLAH."""
         if len(self.children) == 1:
             return self.children[0].collapse()
         return self
 
-    def lambda_to_srcexpr(self) -> SrcExpr:
+    def _lambda_to_srcexpr(self) -> SrcExpr:
         var_symbols = self.children[1]
         var_names: List[str] = []
 
         if isinstance(var_symbols, ParseSymbol):
             # lambda with a single argument
             var_names.append(var_symbols.s)
+
         elif isinstance(var_symbols, ParseTree):
+            # lambda with multiple arguments
             for var_symbol in var_symbols.children:
                 if not isinstance(var_symbol, ParseSymbol):
                     raise ParseError("Expected parameter name!", var_symbol.start)
@@ -689,7 +674,7 @@ class ParseTree(ParseExpr):
 
         return SrcLambda(var_names, body.to_srcexpr())
 
-    def let_to_srcexpr(self) -> SrcExpr:
+    def _let_to_srcexpr(self) -> SrcExpr:
         var_symbol = self.children[1]
 
         if not isinstance(var_symbol, ParseSymbol):
@@ -710,7 +695,7 @@ class ParseTree(ParseExpr):
         binding = (var_name, value.to_srcexpr())
         return SrcLet([binding], body.to_srcexpr())
 
-    def define_to_srcexpr(self) -> SrcExpr:
+    def _define_to_srcexpr(self) -> SrcExpr:
         # same as let_to_srcexpr
         var_symbol = self.children[1]
 
@@ -737,11 +722,11 @@ class ParseTree(ParseExpr):
             word = self.children[0].s
 
             if word == "lambda":
-                return self.lambda_to_srcexpr()
+                return self._lambda_to_srcexpr()
             if word == "let":
-                return self.let_to_srcexpr()
+                return self._let_to_srcexpr()
             if word == "define":
-                return self.define_to_srcexpr()
+                return self._define_to_srcexpr()
                 
             raise ParseError("Unknown word!", self.children[0].start)
 
@@ -754,12 +739,15 @@ class ParseTree(ParseExpr):
 tokenizer = r'''\s*(,@|[()[\]]|"(?:\\.|[^"\\])*"|;.*|[^\s(";)[\]]*)(.*)'''
 
 def tokenize(src: str) -> Generator[Token, None, None]:
+    """Convert source code to a stream of tokens"""
     index = 0
 
+    # DOTALL flag to treat newlines as regular whitespace
     while src_match := re.match(tokenizer, src, flags=re.DOTALL):
         token_str, src = src_match.groups()
         token_span, remaining_span = src_match.span(1), src_match.span(2)
 
+        # If we didn't find any token, raise an error
         if remaining_span[0] == 0:
             raise ParseError("Unexpected character", index)
 
@@ -768,17 +756,20 @@ def tokenize(src: str) -> Generator[Token, None, None]:
 
         index += remaining_span[0]
 
+        # If there's no more source code to tokenize, return
         if not src:
             return
-        old_src = src
 
 reserved_words = {"lambda", "define", "let"}
 
 def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
+    """Convert a stream of tokens to a parse tree"""
+
     # https://norvig.com/lispy2.html
 
     def read_ahead(token: Token) -> ParseExpr:
         if token.s in ")}]":
+            # Should never be a lonely close paren/brace/bracket
             raise ParseError(f"Unexpected '{token.s}'", token.start)
         if token.s == "(":
             children = []
@@ -806,6 +797,7 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
         if token.s in reserved_words:
             return ParseReserved(token.start, token.end, token.s)
 
+        # Match nat literal
         if nat_match := re.search(r"^(\d+)(.*)", token.s):
             value = int(nat_match.group(1))
             remainder = nat_match.group(2)
@@ -815,8 +807,11 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
                 raise ParseError(f"Unexpected character while parsing nat!", index)
             return ParseNat(token.start, token.end, value)
 
+        # Match string literal
         if str_match := re.search(r'''^"((?:\\.|[^"\\])*)"$''', token.s):
             escaped = str_match.group(0)
+
+            # E.g., convert "\n" to actual newline
             unescaped = literal_eval(escaped)
             return ParseStr(token.start, token.end, unescaped)
 
@@ -826,9 +821,13 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
 
 
 def parse(src: str) -> SrcExpr:
+    """Convert source code to AST"""
     tokens = peekable(tokenize(src))
 
     statements: List[ParseExpr] = []
+
+    # There is an implicit block at the top level of the document, so there may
+    # be multiple statements to parse.
 
     while True:
         try:
@@ -836,18 +835,19 @@ def parse(src: str) -> SrcExpr:
         except StopIteration:
             raise ParseError("Unexpected end of input. Maybe an unmatched '('?")
         
+        # Check to see if there's another statement after
         try:
             tokens.peek()
         except StopIteration:
+            # If there isn't, we are done parsing
             break
 
     srcexpr = ParseBlock(0, len(src), statements).to_srcexpr()
-
     return SrcRoot(srcexpr)
 
 
 def dbn_to_blc(dbn: str) -> str:
-    # fortified version of Justine's compile.sh
+    # Fortified version of Justine's compile.sh
 
     binary: List[str] = []
 
@@ -871,6 +871,7 @@ def dbn_to_blc(dbn: str) -> str:
 
 
 def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
+    """Execute de Bruijn notation BLC. Optionally capture stdout."""
     blc = dbn_to_blc(dbn)
     Blc = run(["justine/asc2bin.com"], input=blc.encode("utf-8"), stdout=PIPE).stdout
 
@@ -885,12 +886,38 @@ def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
 
 
 def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Optional[str]:
+    """Execute a SrcExpr. Optionally capture stdout."""
     return exec_dbn(srcexpr.compile({}).to_dbn(), input, capture)
 
 if __name__ == "__main__":
+    # Put your own program here! TODO command-line interface
+
+    # src = '''
+# (define factorial
+    # (lambda n
+    #     (if (is-zero n) 
+    #         (1)
+    #         (* n (factorial (-- n))))))
+    # (print (nat->str (factorial 4)))
+    # '''
+
     src = '''
-    (define (double) (lambda x (+ x x))) 
-    (print (nat->str (double (list-ref [1 19] 1))))
+(define fib
+    (lambda n
+        (if (<= n 2)
+            1
+            (+
+                (fib (-- n))
+                (fib (- n 2))))))
+
+(let num 8
+    {
+        (if (#f)
+            (print (nat->str (fib num)))
+            (print ""))
+
+        (print (list-ref ["1" "2" "3"] 1))
+    })
     '''
 
     try:
