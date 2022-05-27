@@ -273,6 +273,14 @@ class SrcList(SrcExpr):
     def _make_list(self, l: List[SrcExpr]) -> SrcExpr:
         if l == []:
             return SrcNil()
+        # return SrcApp(
+        #         SrcApp(
+        #             SrcVar("cons"),
+        #             l[0]
+        #         ),
+        #         self._make_list(l[1:])
+        #     )
+        
         return SrcAnonAbs(
             SrcApp(
                 SrcApp(
@@ -491,6 +499,7 @@ builtins = {
     "not": dbn_to_srcexpr("λλλ [[2 0] 1]"),
     "xor": dbn_to_srcexpr("λλ [[1 λλ [[2 0] 1]] 0]"),
     "is-zero": dbn_to_srcexpr("λλλ [[2 λ 1] 1]"),
+    "is-nil": dbn_to_srcexpr("λ [[0 λλλ λλ0] λλ1]"),
     "**": dbn_to_srcexpr("λλ [0 1]"),
     "*": dbn_to_srcexpr("λλλ [2 [1 0]]"),
     "++": dbn_to_srcexpr("λλλ [1 [[2 1] 0]]"),
@@ -511,6 +520,7 @@ builtins = {
     "list-ref": list_ref,
     "#t": SrcBool(True),
     "#f": SrcBool(False),
+    "nil": SrcNil(),
 }
 
 @dataclass
@@ -820,6 +830,14 @@ def tokens_to_parseexpr(src: str, tokens: Iterator[Token]) -> ParseExpr:
     return read_ahead(next(tokens))
 
 
+def parse_expr(src: str) -> SrcExpr:
+    tokens = tokenize(src)
+    try:
+        return tokens_to_parseexpr(src, tokens).to_srcexpr()
+    except StopIteration:
+        raise ParseError("Unexpected end of input. Maybe an unmatched '('?")
+
+
 def parse(src: str) -> SrcExpr:
     """Convert source code to AST"""
     tokens = peekable(tokenize(src))
@@ -844,6 +862,15 @@ def parse(src: str) -> SrcExpr:
 
     srcexpr = ParseBlock(0, len(src), statements).to_srcexpr()
     return SrcRoot(srcexpr)
+
+map_func = parse_expr("""
+(lambda (f l)
+    ((is-nil l)
+        nil
+        (cons (f (fst l)) (map f (snd l)))))
+""")
+
+builtins["map"] = map_func
 
 
 def dbn_to_blc(dbn: str) -> str:
@@ -902,26 +929,14 @@ if __name__ == "__main__":
     # '''
 
     src = '''
-(define fib
-    (lambda n
-        (if (<= n 2)
-            1
-            (+
-                (fib (-- n))
-                (fib (- n 2))))))
-
-(let num 8
-    {
-        (if (#f)
-            (print (nat->str (fib num)))
-            (print ""))
-
-        (print (list-ref ["1" "2" "3"] 1))
-    })
+    (define l [3 2 3])
+    (define f (lambda c (++ c)))
+    (print (nat->str (list-ref (map f l) 0)))
     '''
 
     try:
         srcexpr = parse(src)
-        exec_srcexpr(parse(src))
+        print(srcexpr)
+        exec_srcexpr(srcexpr)
     except ParseError as e:
         print(e.format(src), file=sys.stderr)
