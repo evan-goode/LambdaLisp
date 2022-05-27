@@ -442,17 +442,12 @@ class SrcBlock(SrcExpr):
 # Built-in functions can refer to other built-ins (or themselves) and SrcBlock
 # and SrcRoot will work out the recursion/dependencies.
 
-# TODO make a proper base-10 nat->str
-cons_S = SrcAbs("str", SrcCall(SrcVar("pair"), [SrcByte(83), SrcVar("str")]))
-nat_to_str = SrcAbs("n", 
-    SrcCall(SrcVar("n"), [cons_S, SrcStr("")]),
-)
-
 # Index a list. The name comes from Scheme
 list_ref = SrcLambda(["l", "i"], 
     SrcApp(SrcVar("fst"),
         SrcCall(SrcVar("i"), [SrcVar("snd"), SrcVar("l")])))
 
+# simpler builtins
 builtins = {
     "print": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcVar("output"))),
     "if": dbn_to_srcexpr("λ 0"),
@@ -470,17 +465,18 @@ builtins = {
     "--": dbn_to_srcexpr("λλλ [[[2 λλ [0 [1 3]]] λ 1] λ 0]"),
     "+": dbn_to_srcexpr("λλλλ [[3 1] [[2 1] 0]]"),
     "-": dbn_to_srcexpr("λλ [[0 λλλ [[[2 λλ [0 [1 3]]] λ 1] λ 0]] 1]"),
+    "%": dbn_to_srcexpr("λλλλ [[[3 λ [0 λλ 1]] [[3 λ [[[3 λλλ [[0 [2 [5 1]]] 1]] λ 1] 1]] λ 1]] λλ 0]"),
+    # "%": dbn_to_srcexpr("λλλλ [[[3 λ [0 λλ 1]] [[3 λ [[[3 λλλ [[0 [2 [5 1]]] 1]] λ 1] 1]] λ 1]] λλ 0]"),
     "min": dbn_to_srcexpr("λλλλ [[[3 λλ [0 1]] λ1] [[2 λλ [3 [0 1]]] λ1]]"),
     "/": dbn_to_srcexpr("λλλλ [[[3 λλ [0 1]] λ 1] [[3 λ [[[3 λλ [0 1]] λ [3 [0 1]]] λ0]] 0]]"),
     "=": dbn_to_srcexpr("λλ [[[[1 λ [[0 λ0] λ0]] [[0 λλλ [1 2]] λλ0]] λλλ0] λλ1]"),
     "<=": dbn_to_srcexpr("λλ [[[1 λλ [0 1]] λλλ1] [[0 λλ [0 1]] λλλ0]]"),
     "<": dbn_to_srcexpr("λλ [[[0 λλ [0 1]] λλλ0] [[1 λλ [0 1]] λλλ1]]"),
-    "nat->str": nat_to_str,
     "fac": dbn_to_srcexpr("λλ [[[1 λλ [0 [1 λλ [[2 1] [1 0]]]]] λ1] λ0]"),
-    "car": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcBool(True))),
-    "cdr": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcBool(False))),
-    "fst": SrcVar("car"),
-    "snd": SrcVar("cdr"),
+    "fst": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcBool(True))),
+    "snd": SrcAnonAbs(SrcApp(SrcAnonVar(0), SrcBool(False))),
+    "head": SrcVar("fst"),
+    "tail": SrcVar("snd"),
     "list-ref": list_ref,
     "#t": SrcBool(True),
     "#f": SrcBool(False),
@@ -827,15 +823,32 @@ def parse(src: str) -> SrcExpr:
     srcexpr = ParseBlock(0, len(src), statements).to_srcexpr()
     return SrcRoot(srcexpr)
 
-map_func = parse_expr("""
+# More complex builtins
+builtins["map"] = parse_expr("""
 (lambda (f l)
     ((is-nil l)
         nil
         (cons (f (fst l)) (map f (snd l)))))
 """)
 
-builtins["map"] = map_func
+builtins["concat"] = parse_expr("""
+(lambda (list-a list-b)
+    ((is-nil list-a)
+        list-b
+        (cons (fst list-a) (concat (tail list-a) list-b))))
+""")
 
+nat_to_str = parse_expr("""
+(lambda n
+    (let last-digit
+        (list-ref ["0" "1" "2" "3" "4" "5" "6" "7" "8" "9"] (% n 10))
+    (let n-div-10
+        (/ n 10)
+    ((is-zero n-div-10)
+        last-digit
+        (concat (nat->str n-div-10) last-digit)))))
+""")
+builtins["nat->str"] = nat_to_str
 
 def dbn_to_blc(dbn: str) -> str:
     # Fortified version of Justine's compile.sh
@@ -893,14 +906,13 @@ if __name__ == "__main__":
     # '''
 
     src = '''
-    (define l [3 2 3])
-    (define f (lambda c (++ c)))
-    (print (nat->str (list-ref (map f l) 0)))
+    (define a [1 22 3])
+    (define b [4 5 58])
+    (print (nat->str (list-ref (concat a b) 5)))
     '''
 
     try:
         srcexpr = parse(src)
-        print(srcexpr)
         exec_srcexpr(srcexpr)
     except ParseError as e:
         print(e.format(src), file=sys.stderr)
