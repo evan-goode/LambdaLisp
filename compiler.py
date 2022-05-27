@@ -26,42 +26,6 @@ sys.setrecursionlimit(10 ** 6)
 PATH_TO_BLC_INTERPRETER = "./lambda"
 
 
-# Target language (de Bruijn notation Blc)
-class TgtExpr(ABC):
-    """A lambda calculus expression"""
-    @abstractmethod
-    def to_dbn(self) -> str:
-        """Convert to de Bruijn notation"""
-        pass
-
-@dataclass
-class TgtAbs(TgtExpr):
-    """Abstraction (a "λ" followed by an expression)"""
-    expr: TgtExpr
-
-    def to_dbn(self) -> str:
-        return f"λ {self.expr.to_dbn()}"
-
-@dataclass
-class TgtApp(TgtExpr):
-    """Function application"""
-    function: TgtExpr
-    argument: TgtExpr
-
-    def to_dbn(self) -> str:
-        return f"[{self.function.to_dbn()} {self.argument.to_dbn()}]"
-
-@dataclass
-class TgtVar(TgtExpr):
-    """A variable. In DBN, variables are referenced by their "index", or the
-    number of abstractions since the variable was bound, instead of by a
-    name."""
-    index: int
-    def to_dbn(self) -> str:
-        return str(self.index)
-
-# Source language (our Lisp)
-
 Context = Dict[str, int]
 
 class SrcExpr(ABC):
@@ -72,11 +36,11 @@ class SrcExpr(ABC):
         """Convert to a simplified subset of the source language"""
         pass
 
-    def compile(self, context: Context) -> TgtExpr:
+    def to_dbn(self, context: Context) -> str:
         """Convert this expression to an equivalent expression in lambda
         calculus. The `context` parameter maps variable names to their de
         Bruijn indices"""
-        return self.simplify().compile(context)
+        return self.simplify().to_dbn(context)
 
 class SimpleExpr(SrcExpr):
     """Intermediate, simplified subset of source language. We convert to this
@@ -85,7 +49,7 @@ class SimpleExpr(SrcExpr):
     since only SrcVars can make references, but awkward in the source
     language."""
     @abstractmethod
-    def compile(self, context: Context) -> TgtExpr:
+    def to_dbn(self, context: Context) -> str:
         pass
 
     @abstractmethod
@@ -106,13 +70,13 @@ class SrcAbs(SimpleExpr):
     def simplify(self) -> SimpleExpr:
         return SrcAbs(self.var_name, self.expr.simplify())
 
-    def compile(self, context: Context) -> TgtExpr:
+    def to_dbn(self, context: Context) -> str:
         # Increment the de Bruijn index of each variable already bound
         new_context = {k: v + 1 for k, v in context.items()}
 
         # and set the index of the newly-bound variable to 0
         new_context[self.var_name] = 0
-        return TgtAbs(self.expr.compile(new_context))
+        return f"λ {self.expr.to_dbn(new_context)}"
 
 @dataclass
 class SrcAnonAbs(SimpleExpr):
@@ -126,9 +90,9 @@ class SrcAnonAbs(SimpleExpr):
     def simplify(self) -> SimpleExpr:
         return SrcAnonAbs(self.expr.simplify())
 
-    def compile(self, context: Context) -> TgtExpr:
+    def to_dbn(self, context: Context) -> str:
         new_context = {k: v + 1 for k, v in context.items()}
-        return TgtAbs(self.expr.compile(new_context))
+        return f"λ {self.expr.to_dbn(new_context)}"
 
 @dataclass
 class SrcVar(SimpleExpr):
@@ -141,13 +105,13 @@ class SrcVar(SimpleExpr):
     def simplify(self) -> SimpleExpr:
         return self
 
-    def compile(self, context: Context) -> TgtExpr:
+    def to_dbn(self, context: Context) -> str:
         # Look up the variable's index in the `context`
-        return TgtVar(context[self.name])
+        return str(context[self.name])
 
 @dataclass
 class SrcAnonVar(SimpleExpr):
-    """Unnamed variable with only an index. Directly corresponds to TgtVar."""
+    """Unnamed variable with only an index."""
     index: int
 
     def get_references(self) -> frozenset[str]:
@@ -156,12 +120,12 @@ class SrcAnonVar(SimpleExpr):
     def simplify(self) -> SimpleExpr:
         return self
 
-    def compile(self, context: Context) -> TgtExpr:
-        return TgtVar(self.index)
+    def to_dbn(self, context: Context) -> str:
+        return str(self.index)
 
 @dataclass
 class SrcApp(SimpleExpr):
-    """Function application. Directly corresponds to TgtApp."""
+    """Function application."""
     function: SrcExpr
     argument: SrcExpr
 
@@ -171,8 +135,8 @@ class SrcApp(SimpleExpr):
     def simplify(self) -> SimpleExpr:
         return SrcApp(self.function.simplify(), self.argument.simplify())
 
-    def compile(self, context: Context) -> TgtExpr:
-        return TgtApp(self.function.compile(context), self.argument.compile(context))
+    def to_dbn(self, context: Context) -> str:
+        return f"[{self.function.to_dbn(context)} {self.argument.to_dbn(context)}]"
 
 def dbn_to_srcexpr(dbn: str) -> SimpleExpr:
     """Convert de Bruijn notation lambda calculus directly to the source
@@ -187,7 +151,7 @@ def dbn_to_srcexpr(dbn: str) -> SimpleExpr:
             function, remaining = dbn_to_srcexpr_rem(dbn[1:])
             argument, remaining = dbn_to_srcexpr_rem(remaining[1:])
             return SrcApp(function, argument), remaining
-        elif char in "012346789":
+        elif char in "0123456789":
             return SrcAnonVar(int(char)), dbn[1:]
         else:
             return dbn_to_srcexpr_rem(dbn[1:])
@@ -914,7 +878,7 @@ def exec_dbn(dbn: str, input: str="", capture: bool=False) -> Optional[str]:
 
 def exec_srcexpr(srcexpr: SrcExpr, input: str="", capture: bool=False) -> Optional[str]:
     """Execute a SrcExpr. Optionally capture stdout."""
-    return exec_dbn(srcexpr.compile({}).to_dbn(), input, capture)
+    return exec_dbn(srcexpr.to_dbn({}), input, capture)
 
 if __name__ == "__main__":
     # Put your own program here! TODO command-line interface
