@@ -42,7 +42,7 @@ def test_fib():
         ])
     )
 
-    check_output(print_fib, "", "S" * 21)
+    check_output(print_fib, "", "21")
 
 def test_even_odd():
     even = SrcAbs("n",

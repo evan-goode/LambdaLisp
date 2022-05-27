@@ -237,13 +237,6 @@ class SrcList(SrcExpr):
     def _make_list(self, l: List[SrcExpr]) -> SrcExpr:
         if l == []:
             return SrcNil()
-        # return SrcApp(
-        #         SrcApp(
-        #             SrcVar("cons"),
-        #             l[0]
-        #         ),
-        #         self._make_list(l[1:])
-        #     )
         
         return SrcAnonAbs(
             SrcApp(
@@ -705,8 +698,8 @@ class ParseTree(ParseExpr):
         return SrcCall(func, args)
 
 
-# From https://norvig.com/lispy2.html
-tokenizer = r'''\s*(,@|[()[\]]|"(?:\\.|[^"\\])*"|;.*|[^\s(";)[\]]*)(.*)'''
+# Adapted from https://norvig.com/lispy2.html
+tokenizer = r'''(?:\s|;[^\n]*\n)*(,@|[()[\]]|"(?:\\.|[^"\\])*"|;.*|[^\s(";)[\]]*)(.*)'''
 
 def tokenize(src: str) -> Generator[Token, None, None]:
     """Convert source code to a stream of tokens"""
@@ -908,6 +901,7 @@ if __name__ == "__main__":
     src = '''
     (define a [1 22 3])
     (define b [4 5 58])
+    ; comment
     (print (nat->str (list-ref (concat a b) 5)))
     '''
 
